@@ -15,9 +15,11 @@ export interface PiVccSettings {
    *   - auto threshold / overflow
    *   - /pi-vcc (always handled regardless)
    *
-   * When false, pi-vcc only handles /pi-vcc; everything else falls back to
-   * pi core's default LLM-based compaction. Existing config files keep their
-   * stored value; the new default applies to fresh installs only.
+   * When false, pi-vcc only supplies summaries for /pi-vcc; all other
+   * compactions use pi core's default LLM-based compaction. A configured
+   * autoCompactionPercentage still controls when automatic compaction starts.
+   * Existing config files keep their stored value; the new default applies to
+   * fresh installs only.
    */
   overrideDefaultCompaction: boolean;
   /**
@@ -61,6 +63,11 @@ export interface PiVccSettings {
    */
   skipCustomTypes: string[];
   /**
+   * Context-window percentage at which automatic compaction starts. Omitted
+   * means Pi's existing compaction threshold is unchanged.
+   */
+  autoCompactionPercentage?: number;
+  /**
    * Commands whose bash invocations are kept in a "[Tracked Commands]" section,
    * e.g. `["ssh", "kubectl"]`, `["psql"]`, or a prefix like `"gh pr"`. Each
    * entry is the command as written up to the next unquoted separator
@@ -93,10 +100,29 @@ const readJson = (path: string): Record<string, unknown> | null => {
 const coerceStringArray = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
+export const isValidAutoCompactionPercentage = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 100;
+
+let warnedAboutInvalidAutoCompactionPercentage = false;
+
 export function loadSettings(): PiVccSettings {
   const parsed = readJson(settingsPath());
   if (!parsed || typeof parsed !== "object") return { ...DEFAULT_SETTINGS };
   const merged = { ...DEFAULT_SETTINGS, ...(parsed as Partial<PiVccSettings>) };
+  const percentage = parsed.autoCompactionPercentage;
+  if (percentage === undefined) {
+    delete merged.autoCompactionPercentage;
+  } else if (isValidAutoCompactionPercentage(percentage)) {
+    merged.autoCompactionPercentage = percentage;
+  } else {
+    delete merged.autoCompactionPercentage;
+    if (!warnedAboutInvalidAutoCompactionPercentage) {
+      console.warn(
+        "[pi-vcc] Invalid autoCompactionPercentage: expected a number from 1 through 100. Ignoring it; Pi's existing automatic-compaction threshold remains in effect.",
+      );
+      warnedAboutInvalidAutoCompactionPercentage = true;
+    }
+  }
   // A blind spread would leak a malformed array value (e.g. a bare string,
   // where .includes becomes substring matching) into the provider check.
   merged.skipForProviders = coerceStringArray(parsed.skipForProviders);

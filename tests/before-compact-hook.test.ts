@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach, beforeAll, afterAll } fr
 import { existsSync, unlinkSync, writeFileSync, readFileSync, mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { registerBeforeCompactHook, PI_VCC_COMPACT_INSTRUCTION, getLastCompactionStats, formatCompactionStats, buildOwnCut, applyTailBudget } from "../src/hooks/before-compact";
+import { registerBeforeCompactHook, PI_VCC_COMPACT_INSTRUCTION, getLastCompactionStats, formatCompactionStats, buildOwnCut, applyTailBudget, hasReachedAutoCompactionPercentage } from "../src/hooks/before-compact";
 
 let tmpDir: string;
 let CONFIG_PATH: string;
@@ -25,16 +25,24 @@ afterAll(() => {
 });
 
 // Minimal ExtensionAPI stub: capture handler + provide ctx with mocked ui.notify
-function createMockPi() {
+function createMockPi(compactionEvent?: any) {
   let beforeHandler: ((event: any, ctx: any) => any) | undefined;
   let compactHandler: ((event: any, ctx: any) => any) | undefined;
   let beforeAgentStartHandler: ((event: any, ctx: any) => any) | undefined;
+  let turnEndHandler: ((event: any, ctx: any) => any) | undefined;
+  let contextUsage: { tokens: number | null; contextWindow: number } | null = null;
   const notifyCalls: Array<{ msg: string; level: string }> = [];
   const userMessages: Array<string | unknown[]> = [];
   const customMessages: Array<{ message: any; options: any }> = [];
+  const compactCalls: number[] = [];
   const ctx = {
     hasUI: true,
     model: undefined as any,
+    getContextUsage: () => contextUsage,
+    compact: async () => {
+      compactCalls.push(1);
+      if (compactionEvent) await compactHandler?.(compactionEvent, ctx);
+    },
     ui: {
       notify: (msg: string, level: string) => {
         notifyCalls.push({ msg, level });
@@ -47,6 +55,7 @@ function createMockPi() {
         if (eventName === "session_before_compact") beforeHandler = h;
         if (eventName === "session_compact") compactHandler = h;
         if (eventName === "before_agent_start") beforeAgentStartHandler = h;
+        if (eventName === "turn_end") turnEndHandler = h;
       },
       sendUserMessage: (content: string | unknown[]) => {
         userMessages.push(content);
@@ -58,7 +67,12 @@ function createMockPi() {
     invokeBefore: (event: any) => beforeHandler!(event, ctx),
     invokeCompact: (event: any) => compactHandler!(event, ctx),
     invokeBeforeAgentStart: (event: any = { type: "before_agent_start", prompt: "next", systemPrompt: "", systemPromptOptions: {} }) => beforeAgentStartHandler?.(event, ctx),
+    invokeTurnEnd: (event: any = { type: "turn_end" }) => turnEndHandler?.(event, ctx),
+    setContextUsage: (usage: { tokens: number | null; contextWindow: number } | null) => {
+      contextUsage = usage;
+    },
     notifyCalls,
+    compactCalls,
     userMessages,
     customMessages,
     ctx,
@@ -92,7 +106,109 @@ const msg = (id: string, role: "user" | "assistant" | "toolResult", content = "x
 const comp = (id: string, firstKeptEntryId?: string) => ({ id, type: "compaction", firstKeptEntryId });
 const custom = (id: string, customType: string, content: string | unknown[], extra: Record<string, unknown> = {}) => ({ id, type: "custom_message", customType, content, display: false, timestamp: "2026-01-01T00:00:00.000Z", ...extra });
 const branchSummary = (id: string, summary: string, fromId = "f1") => ({ id, type: "branch_summary", summary, fromId, timestamp: "2026-01-01T00:00:00.000Z" });
- 
+
+describe("percentage-based automatic compaction", () => {
+  afterEach(() => {
+    if (existsSync(CONFIG_PATH)) unlinkSync(CONFIG_PATH);
+  });
+
+  test("compares usage against the active context window at the boundary", () => {
+    expect(hasReachedAutoCompactionPercentage(60, { tokens: 59_999, contextWindow: 100_000 })).toBe(false);
+    expect(hasReachedAutoCompactionPercentage(60, { tokens: 60_000, contextWindow: 100_000 })).toBe(true);
+    expect(hasReachedAutoCompactionPercentage(60, { tokens: 120_000, contextWindow: 200_000 })).toBe(true);
+    expect(hasReachedAutoCompactionPercentage(100, { tokens: 99_999, contextWindow: 100_000 })).toBe(false);
+    expect(hasReachedAutoCompactionPercentage(100, { tokens: 100_000, contextWindow: 100_000 })).toBe(true);
+    expect(hasReachedAutoCompactionPercentage(60, { tokens: null, contextWindow: 100_000 })).toBe(false);
+  });
+
+  test("starts at the 60% boundary using the active model's context window", async () => {
+    setConfig({ autoCompactionPercentage: 60, overrideDefaultCompaction: false });
+    const mock = createMockPi();
+    registerBeforeCompactHook(mock.pi);
+
+    mock.setContextUsage({ tokens: 59_999, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(0);
+
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(1);
+  });
+
+  test("recalculates the threshold when the active model changes", async () => {
+    setConfig({ autoCompactionPercentage: 60, overrideDefaultCompaction: false });
+    const mock = createMockPi();
+    registerBeforeCompactHook(mock.pi);
+
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(1);
+
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 200_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(1);
+
+    mock.setContextUsage({ tokens: 120_000, contextWindow: 200_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(2);
+  });
+
+  test("leaves Pi's threshold unchanged when the setting is omitted", async () => {
+    setConfig({ overrideDefaultCompaction: false });
+    const mock = createMockPi();
+    registerBeforeCompactHook(mock.pi);
+
+    mock.setContextUsage({ tokens: 99_000, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    expect(mock.compactCalls).toHaveLength(0);
+  });
+
+  test("continues after percentage-triggered compaction when enabled", async () => {
+    setConfig({ autoCompactionPercentage: 60, continueAfterThresholdCompact: true, overrideDefaultCompaction: false });
+    const mock = createMockPi({ type: "session_compact", fromExtension: false, reason: "manual", willRetry: false });
+    registerBeforeCompactHook(mock.pi);
+
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(mock.compactCalls).toHaveLength(1);
+    expect(mock.customMessages).toHaveLength(1);
+    expect(mock.customMessages[0].message.customType).toBe("pi-vcc-auto-continue");
+  });
+
+  test("does not continue after percentage-triggered compaction when disabled", async () => {
+    setConfig({ autoCompactionPercentage: 60, continueAfterThresholdCompact: false, overrideDefaultCompaction: false });
+    const mock = createMockPi({ type: "session_compact", fromExtension: false, reason: "manual", willRetry: false });
+    registerBeforeCompactHook(mock.pi);
+
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+    await mock.invokeTurnEnd();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(mock.compactCalls).toHaveLength(1);
+    expect(mock.customMessages).toEqual([]);
+  });
+
+  test("defers Pi's native threshold compaction until the configured percentage", () => {
+    setConfig({ autoCompactionPercentage: 60, overrideDefaultCompaction: false });
+    const mock = createMockPi();
+    mock.setContextUsage({ tokens: 50_000, contextWindow: 100_000 });
+    registerBeforeCompactHook(mock.pi);
+
+    const entries = [msg("m1", "user"), msg("m2", "assistant"), msg("m3", "user"), msg("m4", "assistant")];
+    const early = makeEvent(entries, undefined, { reason: "threshold" });
+    early.preparation.tokensBefore = 50_000;
+    expect(mock.invokeBefore(early)).toEqual({ cancel: true });
+
+    const atThreshold = makeEvent(entries, undefined, { reason: "threshold" });
+    atThreshold.preparation.tokensBefore = 60_000;
+    setConfig({ autoCompactionPercentage: 60, overrideDefaultCompaction: true });
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+    expect(mock.invokeBefore(atThreshold)?.compaction).toBeTruthy();
+  });
+});
+
 describe("registerBeforeCompactHook: cancel paths", () => {
   beforeEach(() => {
     if (existsSync(DEBUG_PATH)) unlinkSync(DEBUG_PATH);

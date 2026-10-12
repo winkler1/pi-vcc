@@ -4,6 +4,10 @@ All notable changes to `@sting8k/pi-vcc` are documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Add optional `autoCompactionPercentage` to start automatic compaction at a percentage of the active model's context window. Omitted values keep Pi's existing threshold; valid values are 1 through 100.
+
 ## [0.10.1]
 
 ### Fixes

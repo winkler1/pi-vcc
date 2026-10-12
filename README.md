@@ -169,7 +169,17 @@ Config lives at `~/.pi/agent/pi-vcc-config.json` and is created with these defau
 }
 ```
 
-- **`overrideDefaultCompaction`** *(default `true`)*: pi-vcc handles `/pi-vcc`, `/compact` and automatic compactions. With `false` it only handles `/pi-vcc`. Existing config files keep their value.
+To start automatic compaction at 60% of the active model's context window, add this optional setting:
+
+```json
+{
+  "autoCompactionPercentage": 60
+}
+```
+
+`autoCompactionPercentage` accepts numbers from 1 through 100. When set, it takes precedence over Pi's `compaction.reserveTokens` threshold for when automatic compaction starts; the active model's context window is read at each check, so model changes are respected. When omitted, Pi's existing threshold is unchanged. Invalid values are warned about and ignored. `overrideDefaultCompaction` still determines whether pi-vcc or Pi core performs the compaction.
+
+- **`overrideDefaultCompaction`** *(default `true`)*: pi-vcc supplies summaries for `/pi-vcc`, `/compact` and automatic compactions. With `false`, Pi core supplies the summaries. If `autoCompactionPercentage` is set, it still controls when automatic compaction starts. Existing config files keep their value.
 - **`smartKeepTail`** *(default `true`)*: if the `keep:1` tail is under 5k tokens, keep as many turns as fit in 25k. This is pi-vcc's own limit; Pi's `compaction.keepRecentTokens` does not change it. An explicit `keep:N` is always respected.
 - **`continueAfterThresholdCompact`** *(default `true`)*: after an automatic compaction, tell the agent to carry on instead of stopping. Only used on pi < 0.84.4; newer pi resumes on its own. `false` turns it off everywhere.
 - **`debug`** *(default `false`)*: write details of each compaction (message counts, cut, sections, token calibration) to `/tmp/pi-vcc-debug.json`.

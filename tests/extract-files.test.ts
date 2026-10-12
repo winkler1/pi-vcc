@@ -1,9 +1,9 @@
-import { afterEach, describe, it, expect } from "bun:test";
+import { afterEach, describe, it, expect, spyOn } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { extractFiles } from "../src/extract/files";
-import { DEFAULT_SETTINGS, loadSettings } from "../src/core/settings";
+import { DEFAULT_SETTINGS, isValidAutoCompactionPercentage, loadSettings } from "../src/core/settings";
 import type { NormalizedBlock } from "../src/types";
 
 describe("extractFiles", () => {
@@ -44,15 +44,19 @@ describe("settings defaults", () => {
   it("trackCommands is empty (feature off) by default", () => {
     expect(DEFAULT_SETTINGS.trackCommands).toEqual([]);
   });
+
+  it("leaves the percentage threshold unset by default", () => {
+    expect(DEFAULT_SETTINGS).not.toHaveProperty("autoCompactionPercentage");
+  });
 });
 
 describe("loadSettings coercion", () => {
   // PI_VCC_CONFIG_PATH is settings.ts' existing override — point it at a
   // tmp file so the real ~/.pi/agent/pi-vcc-config.json is never touched.
-  const writeConfig = (value: unknown) => {
+  const writeConfig = (value: unknown, key = "trackCommands") => {
     const dir = mkdtempSync(join(tmpdir(), "pi-vcc-cfg-"));
     const path = join(dir, "config.json");
-    writeFileSync(path, JSON.stringify({ trackCommands: value }));
+    writeFileSync(path, JSON.stringify({ [key]: value }));
     process.env.PI_VCC_CONFIG_PATH = path;
   };
 
@@ -67,5 +71,24 @@ describe("loadSettings coercion", () => {
     }
     writeConfig(["ssh", "kubectl"]);
     expect(loadSettings().trackCommands).toEqual(["ssh", "kubectl"]);
+  });
+
+  it("accepts percentage thresholds from 1 through 100", () => {
+    for (const percentage of [1, 60, 60.5, 100]) {
+      writeConfig(percentage, "autoCompactionPercentage");
+      expect(loadSettings().autoCompactionPercentage).toBe(percentage);
+      expect(isValidAutoCompactionPercentage(percentage)).toBe(true);
+    }
+  });
+
+  it("ignores and clearly warns about invalid percentage thresholds", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    for (const percentage of [0, 101, "60", null]) {
+      writeConfig(percentage, "autoCompactionPercentage");
+      expect(loadSettings().autoCompactionPercentage).toBeUndefined();
+      expect(isValidAutoCompactionPercentage(percentage)).toBe(false);
+    }
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("autoCompactionPercentage"));
+    warning.mockRestore();
   });
 });

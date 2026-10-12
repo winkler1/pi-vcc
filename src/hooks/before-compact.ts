@@ -6,7 +6,7 @@ import { compileRanked } from "../core/summarize";
 import { normalize } from "../core/normalize";
 import { buildGlobalIndexById, loadGlobalIndexById } from "../core/global-indices";
 import { parseKeepAndPrompt, PI_VCC_COMPACT_INSTRUCTION } from "../core/compact-args";
-import { loadSettings, type PiVccSettings } from "../core/settings";
+import { loadSettings, isValidAutoCompactionPercentage, type PiVccSettings } from "../core/settings";
 import { calibrateCharsPerToken, estimateMessageContentChars, estimateMessageContentTokens, estimateTokensFromChars } from "../core/token-estimate";
 import type { PiVccCompactionDetails } from "../details";
 import type { CompactionReason } from "../types";
@@ -35,8 +35,19 @@ export interface CompactionStats {
 export type BudgetCutKind = "no_anchor" | "oversized_tail";
 export const OVERSIZED_TAIL_FACTOR = 2.5;
 
+export const hasReachedAutoCompactionPercentage = (
+  percentage: number,
+  usage: { tokens: number | null; contextWindow: number } | null | undefined,
+): boolean => {
+  if (!isValidAutoCompactionPercentage(percentage) || !usage || usage.tokens === null) return false;
+  if (!Number.isFinite(usage.tokens) || usage.tokens < 0) return false;
+  if (!Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) return false;
+  return usage.tokens * 100 >= percentage * usage.contextWindow;
+};
+
 let lastStats: CompactionStats | null = null;
 let lastCompactWasPiVcc = false;
+let pendingPercentageCompaction = false;
 let pendingFollowUpPrompt: string | null = null;
 let pendingAutoContinueTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -603,16 +614,37 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
     clearPendingAutoContinue();
   });
 
+  pi.on("turn_end", async (_event, ctx) => {
+    const settings = loadSettings();
+    const percentage = settings.autoCompactionPercentage;
+    if (percentage === undefined) return;
+
+    const provider = (ctx as any)?.model?.provider;
+    if (typeof provider === "string" &&
+        settings.skipForProviders.some((p) => p.toLowerCase() === provider.toLowerCase())) return;
+
+    const usage = ctx.getContextUsage();
+    if (!hasReachedAutoCompactionPercentage(percentage, usage)) return;
+
+    pendingPercentageCompaction = true;
+    try {
+      await ctx.compact();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui?.notify?.(`pi-vcc: automatic compaction failed: ${message}`, "warning");
+    } finally {
+      pendingPercentageCompaction = false;
+    }
+  });
+
   pi.on("session_before_compact", (event, ctx) => {
     const { preparation, branchEntries, customInstructions } = event;
     const { reason, willRetry } = readCompactionEventContext(event);
     const settings = loadSettings();
-
     // Always handle explicit /pi-vcc marker.
     // Otherwise, only handle when user opted in via settings.
     const { isPiVcc, keepUserTurns, keepUserTurnsExplicit, followUpPrompt } = parseCompactionInstructions(customInstructions);
     pendingFollowUpPrompt = null;
-    if (!isPiVcc && !settings.overrideDefaultCompaction) return;
     // Provider-level opt-out (#27): defer to the provider's own compaction
     // (e.g. remote compaction via pi-codex-compaction). Checked at call time
     // because the model can change mid-session via /model. Explicit /pi-vcc
@@ -620,6 +652,20 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
     const provider = (ctx as any)?.model?.provider;
     if (!isPiVcc && typeof provider === "string" &&
         settings.skipForProviders.some((p) => p.toLowerCase() === provider.toLowerCase())) return;
+
+    // Pi's native absolute reserve can trigger before a configured percentage.
+    // Defer only when both usage and the active model's window are known; if
+    // either is unavailable, leave Pi's normal safety behavior untouched.
+    if (!isPiVcc && reason === "threshold" && settings.autoCompactionPercentage !== undefined) {
+      const activeWindow = (ctx as any)?.getContextUsage?.()?.contextWindow ?? (ctx as any)?.model?.contextWindow;
+      const tokensBefore = preparation.tokensBefore;
+      if (Number.isFinite(tokensBefore) && Number.isFinite(activeWindow) && activeWindow > 0 &&
+          tokensBefore * 100 < settings.autoCompactionPercentage * activeWindow) {
+        return { cancel: true };
+      }
+    }
+
+    if (!isPiVcc && !settings.overrideDefaultCompaction) return;
 
     const calibrationCut = buildOwnCut(branchEntries as any[], 0);
     const calibrationMessageChars = calibrationCut.ok
@@ -897,6 +943,12 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
   // Fire success toast for /compact path only (delayed to let UI settle).
   // /pi-vcc path uses its own onComplete callback in the command handler.
   pi.on("session_compact", async (event, ctx) => {
+    const isPercentageCompaction = pendingPercentageCompaction;
+    if (isPercentageCompaction) {
+      pendingPercentageCompaction = false;
+      if (loadSettings().continueAfterThresholdCompact) scheduleAutoContinue(pi);
+    }
+
     const { reason, willRetry } = readCompactionEventContext(event);
     if (!event.fromExtension) return;
     // The runner keeps the LAST non-null session_before_compact result, so
