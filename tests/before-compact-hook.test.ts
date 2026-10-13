@@ -39,9 +39,17 @@ function createMockPi(compactionEvent?: any) {
     hasUI: true,
     model: undefined as any,
     getContextUsage: () => contextUsage,
-    compact: async () => {
+    compact: (options: any) => {
       compactCalls.push(1);
-      if (compactionEvent) await compactHandler?.(compactionEvent, ctx);
+      // The host API returns void, not a promise for the compaction operation.
+      if (compactionEvent) {
+        setTimeout(async () => {
+          await compactHandler?.(compactionEvent, ctx);
+          options.onComplete();
+        }, 0);
+      } else {
+        options.onComplete();
+      }
     },
     ui: {
       notify: (msg: string, level: string) => {
@@ -187,6 +195,29 @@ describe("percentage-based automatic compaction", () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
 
     expect(mock.compactCalls).toHaveLength(1);
+    expect(mock.customMessages).toEqual([]);
+  });
+
+  test("keeps percentage compaction in flight until its callback and retries after failure", async () => {
+    setConfig({ autoCompactionPercentage: 60, continueAfterThresholdCompact: false });
+    const mock = createMockPi();
+    const callbacks: any[] = [];
+    mock.ctx.compact = (options: any) => { callbacks.push(options); };
+    registerBeforeCompactHook(mock.pi);
+    mock.setContextUsage({ tokens: 60_000, contextWindow: 100_000 });
+
+    await mock.invokeTurnEnd();
+    await mock.invokeTurnEnd();
+    expect(callbacks).toHaveLength(1);
+    callbacks[0].onError(new Error("Compaction cancelled"));
+    expect(mock.notifyCalls.at(-1)?.msg).toContain("Compaction cancelled");
+
+    await mock.invokeTurnEnd();
+    expect(callbacks).toHaveLength(2);
+    callbacks[1].onComplete();
+    await mock.invokeTurnEnd();
+    expect(callbacks).toHaveLength(3);
+    callbacks[2].onComplete();
     expect(mock.customMessages).toEqual([]);
   });
 

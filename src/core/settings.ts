@@ -36,11 +36,12 @@ export interface PiVccSettings {
    * finished with stop). It avoids a UX cliff where the agent finishes a response,
    * immediately compacts, and then stops instead of continuing the task.
    *
-   * false = never continue. true (default) = continue only on Pi versions that
-   * still need the fallback: Pi >= PI_SELF_RESUME_VERSION resumes the run itself,
-   * so pi-vcc stays silent there even when this is true (issue #22). A version
-   * that cannot be parsed is treated as new Pi, i.e. no continue.
-   * Overflow retry is still owned by pi-core via willRetry.
+   * false = never send pi-vcc's own continue. true (default) = continue after
+   * percentage-triggered compaction of a response without tool calls, or after
+   * native automatic compaction on Pi versions that still need the fallback.
+   * Pi >= PI_SELF_RESUME_VERSION resumes native compaction itself, so pi-vcc
+   * stays silent there (issue #22). An unparseable version also stays silent.
+   * Tool-turn continuation and overflow retry are owned by Pi core.
    */
   continueAfterThresholdCompact: boolean;
   /** Write debug snapshot to /tmp/pi-vcc-debug.json on each compaction. */

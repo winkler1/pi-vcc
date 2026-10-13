@@ -4,6 +4,10 @@ All notable changes to `@sting8k/pi-vcc` are documented in this file.
 
 ## [Unreleased]
 
+### Fixes
+
+- Percentage-triggered compaction now resumes unfinished responses. Wait for Pi's completion callback instead of clearing continuation state when its non-blocking `ctx.compact()` call returns. Tool workflows keep their existing next response without an extra follow-up turn.
+
 ### Features
 
 - Add optional `autoCompactionPercentage` to start automatic compaction at a percentage of the active model's context window. Omitted values keep Pi's existing threshold; valid values are 1 through 100.

@@ -64,7 +64,7 @@ let pendingAutoContinueTimer: ReturnType<typeof setTimeout> | null = null;
 export const AUTO_CONTINUE_CUSTOM_TYPE = "pi-vcc-auto-continue";
 
 /**
- * First Pi version that resumes the run by itself after an automatic compaction.
+ * First Pi version that resumes the run by itself after a native automatic compaction.
  * From this version on pi-vcc's fallback continue is redundant, and because it is
  * scheduled blind (setTimeout(0), no idle check) it lands as a ghost turn once the
  * self-resumed run ends - see issue #22, which reports both behaviours on 0.84.4.
@@ -85,7 +85,7 @@ const parseVersionCore = (version: unknown): [number, number, number] | null => 
 };
 
 /**
- * Two keys must both turn for pi-vcc to send its own continue:
+ * Two keys must both turn for pi-vcc's native-compaction fallback continue:
  *  - `settingEnabled` is the user's permission (`continueAfterThresholdCompact`);
  *    false always wins.
  *  - the running Pi must be old enough to still need the fallback.
@@ -614,10 +614,10 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
     clearPendingAutoContinue();
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("turn_end", (event, ctx) => {
     const settings = loadSettings();
     const percentage = settings.autoCompactionPercentage;
-    if (percentage === undefined) return;
+    if (percentage === undefined || pendingPercentageCompaction) return;
 
     const provider = (ctx as any)?.model?.provider;
     if (typeof provider === "string" &&
@@ -628,12 +628,26 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
 
     pendingPercentageCompaction = true;
     try {
-      await ctx.compact();
+      // compact() starts work and returns void; keep ownership until its callback.
+      ctx.compact({
+        onComplete: () => {
+          pendingPercentageCompaction = false;
+          // Tool turns already have a next response; adding a follow-up would
+          // create an extra run after the task finishes.
+          const toolTurn = event.message?.role === "assistant" && event.message.stopReason === "toolUse";
+          if (!toolTurn && loadSettings().continueAfterThresholdCompact) {
+            scheduleAutoContinue(pi);
+          }
+        },
+        onError: (error) => {
+          pendingPercentageCompaction = false;
+          ctx.ui?.notify?.(`pi-vcc: automatic compaction failed: ${error.message}`, "warning");
+        },
+      });
     } catch (error) {
+      pendingPercentageCompaction = false;
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui?.notify?.(`pi-vcc: automatic compaction failed: ${message}`, "warning");
-    } finally {
-      pendingPercentageCompaction = false;
     }
   });
 
@@ -943,12 +957,6 @@ export const registerBeforeCompactHook = (pi: ExtensionAPI, piVersion: string = 
   // Fire success toast for /compact path only (delayed to let UI settle).
   // /pi-vcc path uses its own onComplete callback in the command handler.
   pi.on("session_compact", async (event, ctx) => {
-    const isPercentageCompaction = pendingPercentageCompaction;
-    if (isPercentageCompaction) {
-      pendingPercentageCompaction = false;
-      if (loadSettings().continueAfterThresholdCompact) scheduleAutoContinue(pi);
-    }
-
     const { reason, willRetry } = readCompactionEventContext(event);
     if (!event.fromExtension) return;
     // The runner keeps the LAST non-null session_before_compact result, so
