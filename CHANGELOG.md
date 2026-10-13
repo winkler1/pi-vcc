@@ -4,6 +4,8 @@ All notable changes to `@sting8k/pi-vcc` are documented in this file.
 
 ## [Unreleased]
 
+## [0.10.2]
+
 ### Fixes
 
 - Percentage-triggered compaction now resumes unfinished responses. Wait for Pi's completion callback instead of clearing continuation state when its non-blocking `ctx.compact()` call returns. Tool workflows keep their existing next response without an extra follow-up turn.
